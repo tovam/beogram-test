@@ -1,0 +1,331 @@
+# Manual build test with permanent signing for a fork of TGX-Android/Telegram-X.
+# Build parameters checked against upstream a302a72bd8490e2b50250409b1f6a5335704154c.
+# Private signing material comes ONLY from GitHub Actions Secrets.
+name: Beogram test - ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Version reserved automatically by build-beogram.py
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beogram-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android 13+ / ARM64 / debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      TERM: xterm
+      SIGNING_CERT_SHA256: ${{ vars.BEOGRAM_SIGNING_CERT_SHA256 }}
+      VERSION_RESERVATION: ${{ vars.BEOGRAM_VERSION_STATE }}
+
+    steps:
+      - name: Check out sources without heavy dependencies
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+
+      - name: Measure disk and remove unused runner tools
+        run: |
+          # These deletions are ONLY for this disposable GitHub-hosted Linux VM.
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$RUNNER_OS" == Linux && "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]
+
+          NDK_VERSION=$(bash scripts/read-property.sh version.properties version.ndk_primary)
+          CMAKE_VERSION=$(bash scripts/read-property.sh version.properties version.cmake)
+          SDK_PACKAGE=$(bash scripts/read-property.sh version.properties version.sdk_package)
+          BUILD_TOOLS_VERSION=$(bash scripts/read-property.sh version.properties version.build_tools)
+          for variable in NDK_VERSION CMAKE_VERSION BUILD_TOOLS_VERSION; do
+            [[ "${!variable}" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+          done
+          [[ "$SDK_PACKAGE" =~ ^android-[0-9]+(\.[0-9]+)*$ ]]
+          printf '%s\n' \
+            "NDK_VERSION=$NDK_VERSION" \
+            "CMAKE_VERSION=$CMAKE_VERSION" \
+            "SDK_PACKAGE=$SDK_PACKAGE" \
+            "BUILD_TOOLS_VERSION=$BUILD_TOOLS_VERSION" >> "$GITHUB_ENV"
+
+          printf 'phase\tavailable_bytes\n' > "$RUNNER_TEMP/disk-phases.tsv"
+          cat > "$RUNNER_TEMP/record-disk.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE"
+          available=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          printf '%s\t%s\n' "$1" "$available" >> "$RUNNER_TEMP/disk-phases.tsv"
+          SH
+          bash "$RUNNER_TEMP/record-disk.sh" before-cleanup
+          free -h
+
+          sudo rm -rf -- \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            "$ANDROID_HOME/emulator" \
+            "$ANDROID_HOME/system-images"
+          for directory in "$ANDROID_HOME"/ndk/*; do
+            [[ -d "$directory" ]] || continue
+            if [[ "${directory##*/}" != "$NDK_VERSION" ]]; then
+              sudo rm -rf -- "$directory"
+            fi
+          done
+          for directory in "$ANDROID_HOME"/cmake/*; do
+            [[ -d "$directory" ]] || continue
+            if [[ "${directory##*/}" != "$CMAKE_VERSION" ]]; then
+              sudo rm -rf -- "$directory"
+            fi
+          done
+          bash "$RUNNER_TEMP/record-disk.sh" after-cleanup
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          # Intentionally no restored cache: measure a first, cold build.
+          cache-jdk: false
+
+      - name: Restore and verify the permanent signing key
+        env:
+          BEOGRAM_KEYSTORE_BASE64: ${{ secrets.BEOGRAM_KEYSTORE_BASE64 }}
+          BEOGRAM_KEYSTORE_PASSWORD: ${{ secrets.BEOGRAM_KEYSTORE_PASSWORD }}
+          BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          os.umask(0o077)
+          password = os.environ.get('BEOGRAM_KEYSTORE_PASSWORD', '')
+          encoded = os.environ.get('BEOGRAM_KEYSTORE_BASE64', '')
+          expected = os.environ.get('SIGNING_CERT_SHA256', '').lower()
+          if not encoded or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', password):
+              raise RuntimeError('Missing signing secrets: run build-beogram.py first.')
+          if not re.fullmatch(r'[0-9a-f]{64}', expected):
+              raise RuntimeError('Missing public signing certificate fingerprint.')
+          version_text = os.environ.get('BUILD_VERSION', '')
+          if not re.fullmatch(r'[0-9]+', version_text):
+              raise RuntimeError('Invalid build version.')
+          version = int(version_text)
+          reservation = json.loads(os.environ.get('VERSION_RESERVATION', '{}'))
+          if (
+              not 1 <= version <= 2_147_483
+              or reservation.get('schema') != 1
+              or reservation.get('base') != version
+              or not reservation.get('identity', '').endswith(':' + os.environ['GITHUB_SHA'])
+          ):
+              raise RuntimeError('Version is not reserved for this commit. Use build-beogram.py.')
+          directory = Path(os.environ['RUNNER_TEMP']) / 'beogram-signing'
+          if directory.is_symlink():
+              raise RuntimeError('Unexpected signing directory.')
+          directory.mkdir(mode=0o700, exist_ok=True)
+          directory.chmod(0o700)
+          keystore = directory / 'beogram.p12'
+          keystore.write_bytes(base64.b64decode(encoded, validate=True))
+          keystore.chmod(0o600)
+          result = subprocess.run([
+              'keytool', '-exportcert', '-keystore', str(keystore), '-alias', 'beogram',
+              '-storepass:env', 'BEOGRAM_KEYSTORE_PASSWORD',
+          ], capture_output=True)
+          if result.returncode or hashlib.sha256(result.stdout).hexdigest() != expected:
+              raise RuntimeError('Signing key does not match the expected certificate.')
+          properties = directory / 'keystore.properties'
+          properties.write_text(
+              f'keystore.file={keystore}\nkeystore.password={password}\n'
+              f'key.alias=beogram\nkey.password={password}\n'
+          )
+          properties.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write(f'APP_VERSION={version}\n')
+          print(f'Permanent certificate verified: {expected}')
+          print(f'Android versionCode: {version * 1000}')
+          PY
+
+      - name: Fetch dependencies and build one ARM64 APK
+        run: |
+          printf 'utc\tavailable_bytes\n' > "$RUNNER_TEMP/disk-samples.tsv"
+          (
+            while :; do
+              available=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+              printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$available" >> "$RUNNER_TEMP/disk-samples.tsv"
+              sleep 15
+            done
+          ) &
+          sampler_pid=$!
+          trap 'kill "$sampler_pid" 2>/dev/null || true' EXIT
+          bash "$RUNNER_TEMP/record-disk.sh" before-dependencies
+
+          echo '::group::Install only the Android packages required by this revision'
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$sdkmanager" ]]
+          # yes can exit with SIGPIPE once sdkmanager has consumed its input.
+          set +o pipefail
+          yes | "$sdkmanager" --sdk_root="$ANDROID_HOME" --licenses
+          license_status=${PIPESTATUS[1]}
+          set -o pipefail
+          [[ "$license_status" == 0 ]]
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" --install \
+            "platforms;$SDK_PACKAGE" \
+            "build-tools;$BUILD_TOOLS_VERSION" \
+            "ndk;$NDK_VERSION" \
+            "cmake;$CMAKE_VERSION"
+          echo '::endgroup::'
+          bash "$RUNNER_TEMP/record-disk.sh" after-sdk
+
+          echo '::group::Fetch pinned submodules and Git LFS files'
+          git lfs install
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 4
+          git lfs pull
+          git submodule foreach --recursive 'git lfs pull'
+          git rev-parse HEAD > "$RUNNER_TEMP/build-source.txt"
+          git submodule status --recursive >> "$RUNNER_TEMP/build-source.txt"
+          echo '::endgroup::'
+          bash "$RUNNER_TEMP/record-disk.sh" after-sources
+
+          # Generated on the runner, never committed. The example application ID
+          # enables upstream's experimental mode (no Firebase project required).
+          # Telegram credentials fall back to upstream's public sample values:
+          # this is a compilation test, NOT an app ready for public distribution.
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          app.id=org.example.beogram
+          app.name=Beogram Test
+          app.sources_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+          app.experimental=true
+          app.version=$APP_VERSION
+          keystore.file=$RUNNER_TEMP/beogram-signing/keystore.properties
+          EOF
+
+          # Use the same private keystore on every runner, including debug builds.
+          # Isolated Projects requires Configuration Cache, enabled upstream.
+          /usr/bin/time -v ./gradlew \
+            :app:validateGitSetup :app:assembleLatestDebug \
+            -Pabi=arm64 \
+            --no-daemon --no-parallel --configuration-cache --max-workers=2 \
+            --console=plain --stacktrace \
+            '-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' \
+            '-Pkotlin.daemon.jvmargs=-Xmx2g' \
+            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+          bash "$RUNNER_TEMP/record-disk.sh" after-build
+
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          tools = Path(os.environ['ANDROID_HOME']) / 'build-tools' / os.environ['BUILD_TOOLS_VERSION']
+          expected = os.environ['SIGNING_CERT_SHA256'].lower()
+          expected_version = int(os.environ['APP_VERSION']) * 1000
+          apks = sorted(Path('app/build/outputs/apk/latest/debug').glob('*.apk'))
+          if not apks:
+              raise RuntimeError('No compiled APK found.')
+          checksums = []
+          for apk in apks:
+              certificate = subprocess.check_output([
+                  str(tools / 'apksigner'), 'verify', '--verbose', '--print-certs', str(apk),
+              ], text=True)
+              fingerprints = re.findall(
+                  r'^(?:V[0-9.]+ )?Signer(?: #[0-9.]+)?:? certificate SHA-256 digest: ([0-9a-fA-F]{64})\s*$',
+                  certificate, re.M,
+              )
+              signer_count = re.search(r'^Number of signers: ([0-9]+)$', certificate, re.M)
+              if not signer_count or signer_count.group(1) != '1' or {value.lower() for value in fingerprints} != {expected}:
+                  raise RuntimeError('APK signed with an unexpected key; refusing publication.')
+              manifest = subprocess.check_output([str(tools / 'aapt2'), 'dump', 'badging', str(apk)], text=True)
+              package = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)'", manifest, re.M)
+              if not package or package.group(1) != 'org.example.beogram' or int(package.group(2)) != expected_version:
+                  raise RuntimeError('Unexpected package name or versionCode; refusing publication.')
+              checksums.append(f'{hashlib.sha256(apk.read_bytes()).hexdigest()}  {apk}')
+              print(f'Verified APK: {apk} (versionCode {expected_version}, certificate {expected})')
+          (Path(os.environ['RUNNER_TEMP']) / 'apk-sha256.txt').write_text('\n'.join(checksums) + '\n')
+          PY
+
+      - name: Remove temporary private signing material
+        if: always()
+        run: |
+          rm -f -- "$RUNNER_TEMP/beogram-signing/keystore.properties" \
+            "$RUNNER_TEMP/beogram-signing/beogram.p12"
+
+      - name: Report disk usage even if the build fails
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/record-disk.sh" ]]; then
+            bash "$RUNNER_TEMP/record-disk.sh" job-end
+          fi
+          du -sh .git app/build app/.cxx tdlib "$HOME/.gradle" "$ANDROID_HOME" 2>/dev/null || true
+          python3 - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          gib = 1024 ** 3
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Disk measurements\n\n')
+              summary.write('| Phase | Free space (GiB) |\n| --- | ---: |\n')
+              phases = temp / 'disk-phases.tsv'
+              if phases.exists():
+                  with phases.open() as stream:
+                      for row in csv.DictReader(stream, delimiter='\t'):
+                          summary.write(f"| {row['phase']} | {int(row['available_bytes']) / gib:.2f} |\n")
+              samples = temp / 'disk-samples.tsv'
+              if samples.exists():
+                  with samples.open() as stream:
+                      values = [int(row['available_bytes']) for row in csv.DictReader(stream, delimiter='\t')]
+                  if values:
+                      summary.write(f'\nMinimum free space sampled during SDK download, source download and compilation: **{min(values) / gib:.2f} GiB** (15-second samples, not an exact continuous peak).\n')
+              summary.write('\nARM64 debug build, Android 13+, permanent signing key, sample Telegram credentials.\n')
+              if os.environ.get('APP_VERSION'):
+                  summary.write(f"\nAndroid versionCode: **{int(os.environ['APP_VERSION']) * 1000}**.\n")
+          PY
+
+      - name: Upload build and disk diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: beogram-test-diagnostics
+          path: |
+            ${{ runner.temp }}/disk-*.tsv
+            ${{ runner.temp }}/gradle-build.log
+            ${{ runner.temp }}/build-source.txt
+            ${{ runner.temp }}/apk-sha256.txt
+            app/build/generated/tgx/**/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload signed debug APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: beogram-test-arm64-debug
+          path: app/build/outputs/apk/latest/debug/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
